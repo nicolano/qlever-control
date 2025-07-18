@@ -1,22 +1,19 @@
 from __future__ import annotations
 
-import json
 import os
-import re
 import signal
 import time
-from datetime import datetime, timezone
-
-import rdflib.term
-import requests
-from rdflib import Graph
-from termcolor import colored
 
 from qlever.command import QleverCommand
 from qlever.log import log
 from qlever.util import run_command
 
 from qlever.containerize import Containerize
+
+
+# Exception to be raised when the user interrupts the command with Ctrl+C.
+class UserInterruptException(Exception):
+    pass
 
 
 class OsmUpdateCommand(QleverCommand):
@@ -27,6 +24,10 @@ class OsmUpdateCommand(QleverCommand):
     def __init__(self):
         self.planet_replication_server_url = \
             "https://planet.osm.org/replication/"
+        # Remember if Ctrl+C was pressed and if a update is currently running,
+        # so we can handle it gracefully.
+        self.is_running_update = False
+        self.ctrl_c_pressed = False
 
     def description(self) -> str:
         return "Update OSM data for a given dataset"
@@ -44,8 +45,16 @@ class OsmUpdateCommand(QleverCommand):
             nargs=1,
             choices=["minute", "hour", "day"],
             type=str,
-            help="The interval in which the OSM data should be updated."
+            help="The granularity with which the OSM data should be updated. "
                  "Choose from 'minute', 'hour', or 'day'.",
+        )
+        subparser.add_argument(
+            "--once",
+            action='store_true',
+            default=False,
+            help="If set, the OSM data will be updated only once. "
+                 "Otherwise, it will be updated continuously at the specified "
+                 "granularity.",
         )
         subparser.add_argument(
             "--polyfile",
@@ -65,31 +74,94 @@ class OsmUpdateCommand(QleverCommand):
                  "('https://planet.osm.org/replication/) is used."
         )
 
+    # Handle Ctrl+C gracefully by finishing the current update and then
+    # exiting.
+    def handle_ctrl_c(self, signal_received, frame):
+        if self.ctrl_c_pressed:
+            log.warn("\rCtrl+C pressed again, undoing the previous Ctrl+C")
+            self.ctrl_c_pressed = False
+        else:
+            self.ctrl_c_pressed = True
+            if self.is_running_update:
+                log.warn("\rCtrl+C pressed, will finish the current update "
+                         "and then exit [press Ctrl+C again to continue]")
+            else:
+                raise UserInterruptException()
+
     def execute(self, args) -> bool:
         # If the user has specified a replication server, use that one,
         # otherwise we use the planet replication server with the specified
         # granularity.
         granularity = args.granularity[0]
+        replications_server: str
         if args.replication_server:
             replication_server = args.replication_server
         else:
             replication_server = (f"{self.planet_replication_server_url}"
                                   f"{granularity}/")
 
-        cmd_description = []
-        cmd_description.append(
-            f"Update OSM data for dataset '{args.name}' with granularity "
-            f"'{granularity}' from the OSM replication server "
-            f"'{replication_server}'."
-        )
+        granularity_in_seconds: int
+        if granularity == "minute":
+            granularity_in_seconds = 60
+        elif granularity == "hour":
+            granularity_in_seconds = 3600
+        elif granularity == "day":
+            granularity_in_seconds = 86400
+
+        cmd_description = [
+            f"Update OSM data for dataset '{args.name}' with "
+            f"granularity '{granularity}' from the OSM replication"
+            f" server '{replication_server}'."]
         self.show("\n".join(cmd_description), only_show=args.show)
 
-        if not self.execute_olu(replication_server, args):
+        signal.signal(signal.SIGINT, self.handle_ctrl_c)
+        if not args.once and not args.show:
+            log.warn(
+                "Press Ctrl+C to finish any currently running updates and end "
+                "gracefully, press Ctrl+C again to continue\n"
+            )
+
+        # Construct the command to run the osm-live-updates tool.
+        olu_cmd = self.construct_olu_cmd(replication_server, args)
+        self.show(f"{olu_cmd}")
+        if args.show:
+            return True
+
+        try:
+            while True:
+                if self.ctrl_c_pressed:
+                    raise UserInterruptException()
+
+                start_time = time.time()
+
+                self.is_running_update = True
+                log.info(f"Starting OSM data update...")
+                run_command(olu_cmd, show_output=True, show_stderr=True)
+                log.info("\nOSM data update completed successfully.")
+                self.is_running_update = False
+
+                # If the user has specified `--once`, we exit after the
+                # first update.
+                if args.once:
+                    return True
+
+                # Wait for the next update interval based on the granularity
+                elapsed = time.time() - start_time
+                sleep_time = max(0, granularity_in_seconds - elapsed)
+                if sleep_time > 0:
+                    log.info(f"\nWaiting for {sleep_time:.0f} seconds "
+                             f"until the next update...")
+                time.sleep(sleep_time)
+
+        except UserInterruptException:
+            log.info("\nOSM data update interrupted by user.")
+            return True
+
+        except BaseException as e:
+            log.error(f"An error occurred during the OSM data update: {e}")
             return False
 
-        return True
-
-    def execute_olu(self, replication_server_url: str, args) -> bool:
+    def construct_olu_cmd(self, replication_server_url: str, args) -> str:
         sparql_endpoint = f"http://{args.host_name}:{args.port}"
         container_name = f"olu-{args.name}"
 
@@ -97,6 +169,7 @@ class OsmUpdateCommand(QleverCommand):
         olu_cmd += f" -a {args.access_token}"
         olu_cmd += f" -f {replication_server_url}"
         olu_cmd += f" --qlever"
+        olu_cmd += f" --statistics"
 
         # If the user has specified a polygon file, we add it to the command.
         if args.polyfile:
@@ -121,14 +194,4 @@ class OsmUpdateCommand(QleverCommand):
             use_bash=False
         )
 
-        self.show(f"{olu_cmd}", only_show=args.show)
-        if args.show:
-            return True
-
-        try:
-            run_command(olu_cmd, show_output=True)
-        except Exception as e:
-            log.error(f"Error running osm-live-updates: {e}")
-            return False
-
-        return True
+        return olu_cmd
